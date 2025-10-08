@@ -51,7 +51,7 @@ RUN pip install --upgrade pip setuptools wheel \
   && pip install -r requirements.txt \
   && pip install "llama-cpp-python" \
   && pip install "onnxruntime" 
-  # && pip install "pyaudio"
+# && pip install "pyaudio"
 
 # Copy the rest of the project into the image
 # (This keeps installed pip packages cached from earlier step)
@@ -77,8 +77,11 @@ WORKDIR /workspace
 # Provide a small entrypoint helper script that users can override
 # If you want the container to run an example by default, change ENTRYPOINT/CMD
 # ENTRYPOINT ["/bin/bash"]
-ENTRYPOINT ["python", "-m", "examples.wyoming_server", \
-  "--uri", "tcp://0.0.0.0:10600", \
+CMD ["python", "-m", "examples.wyoming_server", \
+  "--uri", "tcp://0.0.0.0:10200", \
+  "--debug", \
+  # "--voice", "name=joi,ref_audio=samples/joi.wav,ref_text=samples/joi.txt", \
+  # "--backbone", "neuphonic/neutts-air-q4-gguf"]
   "--voice", "name=joi,ref_codes=samples/joi.pt,ref_text=samples/joi.txt", \
   "--backbone", "neuphonic/neutts-air-q4-gguf", \
   "--codec", "neuphonic/neucodec-onnx-decoder" ]

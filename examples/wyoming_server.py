@@ -128,6 +128,7 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
         await self.write_event(AudioStart(rate=self._sample_rate, width=2, channels=1).event())
 
         for chunk in _chunk_bytes(audio_bytes, chunk_bytes):
+            LOGGER.debug("Streaming audio chunk of %d bytes", len(chunk))
             await self.write_event(
                 AudioChunk(
                     rate=self._sample_rate,
@@ -136,6 +137,7 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
                     audio=chunk,
                 ).event()
             )
+        LOGGER.debug("Audio stream complete")
 
         await self.write_event(AudioStop().event())
 
