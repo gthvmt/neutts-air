@@ -1,0 +1,1 @@
+podman run --rm -it -v "${PWD}:/workspace" -v hf_cache:/home/neutts/.cache/huggingface -w /workspace neutts-air:latest
