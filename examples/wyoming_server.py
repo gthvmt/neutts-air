@@ -15,7 +15,7 @@ from wyoming.error import Error
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
-from wyoming.tts import Synthesize, SynthesizeVoice
+from wyoming.tts import Synthesize, SynthesizeVoice, SynthesizeStart, SynthesizeChunk, SynthesizeStop
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,21 +62,70 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
         self._chunk_size = max(1, chunk_size)
         self._sample_rate = self._tts.sample_rate
 
+        # Streaming state
+        self._streaming = False
+        self._stream_voice = None
+        self._stream_text_buffer = ""
+
     async def handle_event(self, event: Event) -> bool:
         if event is None:
             return False
 
-        if Describe.is_type(event.type):
+        # Handle info request
+        if event.type == "describe":
             await self.write_event(self._info_event)
             LOGGER.debug("Provided Wyoming info to client")
             return True
 
-        if event.type != "synthesize":
-            LOGGER.debug("Ignoring unsupported event type: %s", event.type)
+        # Handle regular synthesis
+        if event.type == "synthesize":
+            synthesize = Synthesize.from_event(event)
+            voice = self._select_voice(synthesize.voice)
+            if voice is None:
+                await self.write_event(
+                    Error(
+                        text="Requested voice not available",
+                        code="voice-not-found",
+                    ).event()
+                )
+                return True
+
+            LOGGER.info("Synthesizing text with voice '%s'", voice.name)
+            await self._synthesize_and_stream(synthesize.text, voice)
             return True
 
-        synthesize = Synthesize.from_event(event)
-        voice = self._select_voice(synthesize.voice)
+        # Handle streaming synthesis start
+        if event.type == "synthesize-start":
+            await self._handle_synthesize_start(event)
+            return True
+
+        # Handle streaming text chunks
+        if event.type == "synthesize-chunk":
+            await self._handle_synthesize_chunk(event)
+            return True
+
+        # Handle streaming synthesis stop
+        if event.type == "synthesize-stop":
+            await self._handle_synthesize_stop()
+            return True
+
+        LOGGER.debug("Ignoring unsupported event type: %s", event.type)
+        return True
+
+    async def _handle_synthesize_start(self, event: Event) -> None:
+        """Initialize streaming synthesis session."""
+        if self._streaming:
+            await self.write_event(
+                Error(
+                    text="Already in streaming mode",
+                    code="streaming-active",
+                ).event()
+            )
+            return
+
+        synthesize_start = SynthesizeStart.from_event(event)
+        voice = self._select_voice(synthesize_start.voice)
+        
         if voice is None:
             await self.write_event(
                 Error(
@@ -84,18 +133,65 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
                     code="voice-not-found",
                 ).event()
             )
-            return True
+            return
 
-        LOGGER.info("Synthesizing text with voice '%s'", voice.name)
+        self._streaming = True
+        self._stream_voice = voice
+        self._stream_text_buffer = ""
+        
+        LOGGER.info("Started streaming synthesis with voice '%s'", voice.name)
 
-        try:
-            wav = await asyncio.to_thread(
-                self._tts.infer,
-                synthesize.text,
-                voice.ref_codes,
-                voice.ref_text,
+    async def _handle_synthesize_chunk(self, event: Event) -> None:
+        """Accumulate text chunks for streaming synthesis."""
+        if not self._streaming:
+            await self.write_event(
+                Error(
+                    text="Not in streaming mode",
+                    code="streaming-not-started",
+                ).event()
             )
-        except Exception as err:  # pylint: disable=broad-except
+            return
+
+        synthesize_chunk = SynthesizeChunk.from_event(event)
+        self._stream_text_buffer += synthesize_chunk.text
+        LOGGER.debug("Received text chunk: '%s'", synthesize_chunk.text)
+
+    async def _handle_synthesize_stop(self) -> None:
+        """Finalize and synthesize accumulated text."""
+        if not self._streaming:
+            await self.write_event(
+                Error(
+                    text="Not in streaming mode",
+                    code="streaming-not-started",
+                ).event()
+            )
+            return
+
+        voice = self._stream_voice
+        text = self._stream_text_buffer
+        
+        # Reset streaming state
+        self._streaming = False
+        self._stream_voice = None
+        self._stream_text_buffer = ""
+
+        if not text.strip():
+            LOGGER.warning("No text to synthesize")
+            await self.write_event(AudioStop().event())
+            return
+
+        LOGGER.info("Synthesizing accumulated text: '%s'", text)
+        await self._synthesize_and_stream(text, voice)
+
+    async def _synthesize_and_stream(self, text: str, voice) -> None:
+        """Synthesize text and stream audio back to client."""
+        try:
+            # Check if streaming inference is available
+            if hasattr(self._tts, 'infer_stream'):
+                await self._synthesize_streaming(text, voice)
+            else:
+                await self._synthesize_non_streaming(text, voice)
+        except Exception as err:
             LOGGER.exception("Failed to synthesize audio")
             await self.write_event(
                 Error(
@@ -103,10 +199,69 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
                     code=type(err).__name__,
                 ).event()
             )
-            return True
 
-        await self._stream_audio(wav)
-        return True
+    async def _synthesize_streaming(self, text: str, voice) -> None:
+        """Use streaming inference for real-time audio generation."""
+        LOGGER.info("Using streaming synthesis")
+        
+        # Send audio start event
+        await self.write_event(
+            AudioStart(rate=self._sample_rate, width=2, channels=1).event()
+        )
+
+        # def stream_generator():
+            # for chunk in self._tts.infer_stream(text, voice.ref_codes, voice.ref_text):
+            #     yield chunk
+
+        # Stream audio chunks as they're generated
+        for audio_chunk in await asyncio.to_thread(lambda: list(self._tts.infer_stream(text, voice.ref_codes, voice.ref_text))):
+            audio_bytes = _to_pcm16_bytes(audio_chunk)
+            
+            await self.write_event(
+                AudioChunk(
+                    rate=self._sample_rate,
+                    width=2,
+                    channels=1,
+                    audio=audio_bytes,
+                ).event()
+            )
+            LOGGER.debug("Streamed audio chunk of %d bytes", len(audio_bytes))
+
+        await self.write_event(AudioStop().event())
+        LOGGER.info("Streaming synthesis complete")
+
+    async def _synthesize_non_streaming(self, text: str, voice) -> None:
+        """Fallback to non-streaming synthesis."""
+        LOGGER.info("Using non-streaming synthesis")
+        
+        wav = await asyncio.to_thread(
+            self._tts.infer,
+            text,
+            voice.ref_codes,
+            voice.ref_text,
+        )
+        
+        audio_bytes = _to_pcm16_bytes(wav)
+        bytes_per_sample = 2
+        chunk_bytes = self._chunk_size * bytes_per_sample
+
+        await self.write_event(
+            AudioStart(rate=self._sample_rate, width=2, channels=1).event()
+        )
+
+        for i in range(0, len(audio_bytes), chunk_bytes):
+            chunk = audio_bytes[i:i + chunk_bytes]
+            await self.write_event(
+                AudioChunk(
+                    rate=self._sample_rate,
+                    width=2,
+                    channels=1,
+                    audio=chunk,
+                ).event()
+            )
+            LOGGER.debug("Streaming audio chunk of %d bytes", len(chunk))
+
+        await self.write_event(AudioStop().event())
 
     def _select_voice(self, request_voice: Optional[SynthesizeVoice]) -> Optional[VoiceProfile]:
         if request_voice is not None:
@@ -119,28 +274,6 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
                         return voice
 
         return self._voices.get(self._default_voice)
-
-    async def _stream_audio(self, wav: np.ndarray | torch.Tensor) -> None:
-        audio_bytes = _to_pcm16_bytes(wav)
-        bytes_per_sample = 2  # int16 mono
-        chunk_bytes = self._chunk_size * bytes_per_sample
-
-        await self.write_event(AudioStart(rate=self._sample_rate, width=2, channels=1).event())
-
-        for chunk in _chunk_bytes(audio_bytes, chunk_bytes):
-            LOGGER.debug("Streaming audio chunk of %d bytes", len(chunk))
-            await self.write_event(
-                AudioChunk(
-                    rate=self._sample_rate,
-                    width=2,
-                    channels=1,
-                    audio=chunk,
-                ).event()
-            )
-        LOGGER.debug("Audio stream complete")
-
-        await self.write_event(AudioStop().event())
-
 
 def _chunk_bytes(data: bytes, chunk_size: int) -> Iterable[bytes]:
     if chunk_size <= 0:
