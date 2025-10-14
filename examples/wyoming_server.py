@@ -209,10 +209,6 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
             AudioStart(rate=self._sample_rate, width=2, channels=1).event()
         )
 
-        # def stream_generator():
-            # for chunk in self._tts.infer_stream(text, voice.ref_codes, voice.ref_text):
-            #     yield chunk
-
         # Stream audio chunks as they're generated
         for audio_chunk in await asyncio.to_thread(lambda: list(self._tts.infer_stream(text, voice.ref_codes, voice.ref_text))):
             audio_bytes = _to_pcm16_bytes(audio_chunk)

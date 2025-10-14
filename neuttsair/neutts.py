@@ -75,9 +75,6 @@ class NeuTTSAir:
 
         self._load_codec(codec_repo, codec_device)
 
-        # Load watermarker
-        self.watermarker = perth.PerthImplicitWatermarker()
-
     def _load_backbone(self, backbone_repo, backbone_device):
         print(f"Loading backbone from: {backbone_repo} on {backbone_device} ...")
 
@@ -164,9 +161,7 @@ class NeuTTSAir:
 
         # Decode
         wav = self._decode(output_str)
-        watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=24_000)
-
-        return watermarked_wav
+        return wav
     
     def infer_stream(self, text: str, ref_codes: np.ndarray | torch.Tensor, ref_text: str) -> Generator[np.ndarray, None, None]:
         """
@@ -343,7 +338,6 @@ class NeuTTSAir:
                 )
                 curr_codes = token_cache[tokens_start:tokens_end]
                 recon = self._decode("".join(curr_codes))
-                recon = self.watermarker.apply_watermark(recon, sample_rate=24_000)
                 recon = recon[sample_start:sample_end]
                 audio_cache.append(recon)
 
@@ -375,7 +369,6 @@ class NeuTTSAir:
             ) * self.hop_length
             curr_codes = token_cache[tokens_start:]
             recon = self._decode("".join(curr_codes))
-            recon = self.watermarker.apply_watermark(recon, sample_rate=24_000)
             recon = recon[sample_start:]
             audio_cache.append(recon)
 
