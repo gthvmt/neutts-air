@@ -83,6 +83,6 @@ CMD ["python", "-m", "examples.wyoming_server", \
   # "--voice", "name=joi,ref_audio=samples/joi.wav,ref_text=samples/joi.txt", \
   # "--backbone", "neuphonic/neutts-air-q4-gguf"]
   "--voice", "name=joi,ref_codes=samples/joi.pt,ref_text=samples/joi.txt", \
-  "--backbone", "neuphonic/neutts-air-q4-gguf", \
-  "--codec", "neuphonic/neucodec-onnx-decoder" ]
+  "--backbone", "models/neutts-air-q4-gguf.gguf", \
+  "--codec", "models/neucodec-onnx-decoder.onnx" ]
 # CMD ["-c", "echo 'Container ready. Mount your models and run python -m examples.basic_example ...' && /bin/bash"]

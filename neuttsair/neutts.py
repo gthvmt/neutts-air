@@ -9,6 +9,7 @@ from neucodec import NeuCodec, DistillNeuCodec
 from phonemizer.backend import EspeakBackend
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
 from threading import Thread
+import os
 
 
 def _linear_overlap_add(frames: list[np.ndarray], stride: int) -> np.ndarray:
@@ -46,7 +47,18 @@ class NeuTTSAir:
         backbone_device="cpu",
         codec_repo="neuphonic/neucodec",
         codec_device="cpu",
+        local_files_only=False,
     ):
+        """
+        Initialize NeuTTSAir with support for local models.
+        
+        Args:
+            backbone_repo: Path to backbone model (local path or HF repo)
+            backbone_device: Device for backbone ("cpu" or "cuda")
+            codec_repo: Path to codec model (local path or HF repo)
+            codec_device: Device for codec ("cpu" or "cuda")
+            local_files_only: If True, only load from local paths (no HF downloads)
+        """
 
         # Consts
         self.sample_rate = 24_000
@@ -61,6 +73,9 @@ class NeuTTSAir:
         # ggml & onnx flags
         self._is_quantized_model = False
         self._is_onnx_codec = False
+        
+        # Store local files setting
+        self.local_files_only = local_files_only
 
         # HF tokenizer
         self.tokenizer = None
@@ -75,11 +90,15 @@ class NeuTTSAir:
 
         self._load_codec(codec_repo, codec_device)
 
+    def _is_local_path(self, path: str) -> bool:
+        """Check if the path is a local file/directory."""
+        return os.path.exists(path) or path.endswith('.gguf')
+
     def _load_backbone(self, backbone_repo, backbone_device):
         print(f"Loading backbone from: {backbone_repo} on {backbone_device} ...")
 
-        # GGUF loading
-        if backbone_repo.endswith("gguf"):
+        # GGUF loading (local or remote)
+        if backbone_repo.endswith("gguf") or (self._is_local_path(backbone_repo) and Path(backbone_repo).suffix == '.gguf'):
 
             try:
                 from llama_cpp import Llama
@@ -90,55 +109,89 @@ class NeuTTSAir:
                     "    pip install llama-cpp-python"
                 ) from e
 
-            self.backbone = Llama.from_pretrained(
-                repo_id=backbone_repo,
-                filename="*.gguf",
-                verbose=False,
-                n_gpu_layers=-1 if backbone_device == "gpu" else 0,
-                n_ctx=self.max_context,
-                mlock=True,
-                flash_attn=True if backbone_device == "gpu" else False,
-            )
+            # Check if it's a local file path
+            if os.path.isfile(backbone_repo):
+                # Load from local file
+                self.backbone = Llama(
+                    model_path=backbone_repo,
+                    verbose=False,
+                    n_gpu_layers=-1 if backbone_device == "gpu" else 0,
+                    n_ctx=self.max_context,
+                    mlock=True,
+                    flash_attn=True if backbone_device == "gpu" else False,
+                )
+            else:
+                # print models under local neuphonic
+                print("no models under local models dir:")
+                print(os.listdir("/models"))
+                # Load from HF repo
+                self.backbone = Llama.from_pretrained(
+                    repo_id=backbone_repo,
+                    filename="*.gguf",
+                    verbose=False,
+                    n_gpu_layers=-1 if backbone_device == "gpu" else 0,
+                    n_ctx=self.max_context,
+                    mlock=True,
+                    flash_attn=True if backbone_device == "gpu" else False,
+                )
             self._is_quantized_model = True
 
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(backbone_repo)
-            self.backbone = AutoModelForCausalLM.from_pretrained(backbone_repo).to(
-                torch.device(backbone_device)
-            )
+            # Load PyTorch model (local or remote)
+            load_kwargs = {}
+            if self.local_files_only or self._is_local_path(backbone_repo):
+                load_kwargs['local_files_only'] = True
+            
+            self.tokenizer = AutoTokenizer.from_pretrained(backbone_repo, **load_kwargs)
+            self.backbone = AutoModelForCausalLM.from_pretrained(
+                backbone_repo, **load_kwargs
+            ).to(torch.device(backbone_device))
 
     def _load_codec(self, codec_repo, codec_device):
 
         print(f"Loading codec from: {codec_repo} on {codec_device} ...")
-        match codec_repo:
-            case "neuphonic/neucodec":
-                self.codec = NeuCodec.from_pretrained(codec_repo)
-                self.codec.eval().to(codec_device)
-            case "neuphonic/distill-neucodec":
-                self.codec = DistillNeuCodec.from_pretrained(codec_repo)
-                self.codec.eval().to(codec_device)
-            case "neuphonic/neucodec-onnx-decoder":
+        
+        # Determine if loading locally
+        load_kwargs = {}
+        if self.local_files_only or self._is_local_path(codec_repo):
+            load_kwargs['local_files_only'] = True
+        
+        # Check for standard codec names or local paths
+        codec_path = Path(codec_repo) if self._is_local_path(codec_repo) else None
+        codec_name = codec_path.name if codec_path else codec_repo.split('/')[-1]
+        
+        if "neucodec-onnx-decoder" in codec_name or codec_name == "neucodec-onnx-decoder":
+            if codec_device != "cpu":
+                raise ValueError("Onnx decoder only currently runs on CPU.")
 
-                if codec_device != "cpu":
-                    raise ValueError("Onnx decoder only currently runs on CPU.")
+            try:
+                from neucodec import NeuCodecOnnxDecoder
+            except ImportError as e:
+                raise ImportError(
+                    "Failed to import the onnx decoder."
+                    " Ensure you have onnxruntime installed as well as neucodec >= 0.0.4."
+                ) from e
 
-                try:
-                    from neucodec import NeuCodecOnnxDecoder
-                except ImportError as e:
-                    raise ImportError(
-                        "Failed to import the onnx decoder."
-                        " Ensure you have onnxruntime installed as well as neucodec >= 0.0.4."
-                    ) from e
-
-                self.codec = NeuCodecOnnxDecoder.from_pretrained(codec_repo)
-                self._is_onnx_codec = True
-
-            case _:
-                raise ValueError(
-                    "Invalid codec repo! Must be one of:"
-                    " 'neuphonic/neucodec', 'neuphonic/distill-neucodec',"
-                    " 'neuphonic/neucodec-onnx-decoder'."
-                )
+            if codec_path:
+                self.codec = NeuCodecOnnxDecoder(codec_path)
+            else:
+                self.codec = NeuCodecOnnxDecoder.from_pretrained(codec_repo, **load_kwargs)
+            self._is_onnx_codec = True
+            
+        elif "distill-neucodec" in codec_name or codec_name == "distill-neucodec":
+            self.codec = DistillNeuCodec.from_pretrained(codec_repo, **load_kwargs)
+            self.codec.eval().to(codec_device)
+            
+        elif "neucodec" in codec_name or codec_name == "neucodec":
+            self.codec = NeuCodec.from_pretrained(codec_repo, **load_kwargs)
+            self.codec.eval().to(codec_device)
+            
+        else:
+            raise ValueError(
+                f"Could not determine codec type from path: {codec_repo}. "
+                "Please ensure the path contains 'neucodec', 'distill-neucodec', "
+                "or 'neucodec-onnx-decoder' in its name, or use a recognized HF repo."
+            )
 
     def infer(self, text: str, ref_codes: np.ndarray | torch.Tensor, ref_text: str) -> np.ndarray:
         """
