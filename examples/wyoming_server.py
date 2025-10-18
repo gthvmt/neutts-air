@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, AsyncGenerator
 
 import numpy as np
 import torch
@@ -25,7 +25,7 @@ class VoiceProfile:
     """Represents a cloned voice that can be served over Wyoming."""
 
     name: str
-    ref_codes: List[int]
+    ref_codes: np.ndarray
     ref_text: str
     description: Optional[str] = None
     language: str = "en"
@@ -63,9 +63,9 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
         self._sample_rate = self._tts.sample_rate
 
         # Streaming state
-        self._streaming = False
         self._stream_voice = None
-        self._stream_text_buffer = ""
+        self._stream_text_queue = None
+        self._stream_task = None
 
     async def handle_event(self, event: Event) -> bool:
         if event is None:
@@ -114,10 +114,10 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
 
     async def _handle_synthesize_start(self, event: Event) -> None:
         """Initialize streaming synthesis session."""
-        if self._streaming:
+        if self._stream_text_queue:
             await self.write_event(
                 Error(
-                    text="Already in streaming mode",
+                    text="Stream text queue is already initialized",
                     code="streaming-active",
                 ).event()
             )
@@ -135,59 +135,116 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
             )
             return
 
-        self._streaming = True
         self._stream_voice = voice
-        self._stream_text_buffer = ""
+        self._stream_text_queue = asyncio.Queue()
+        
+        # Start synthesis in background task
+        self._stream_task = asyncio.create_task(
+            self._run_streaming_synthesis(voice)
+        )
         
         LOGGER.info("Started streaming synthesis with voice '%s'", voice.name)
 
-    async def _handle_synthesize_chunk(self, event: Event) -> None:
-        """Accumulate text chunks for streaming synthesis."""
-        if not self._streaming:
+    async def _run_streaming_synthesis(self, voice: VoiceProfile) -> None:
+        """Background task that runs the streaming synthesis."""
+        try:
+            # Send audio start event
+            await self.write_event(
+                AudioStart(rate=self._sample_rate, width=2, channels=1).event()
+            )
+            LOGGER.info("Sent AudioStart event")
+            
+            # Process the text stream and generate audio
+            async for audio_chunk in self._tts.infer_from_stream(
+                self._get_text_stream(),
+                voice.ref_codes,
+                voice.ref_text,
+            ):
+                audio_bytes = _to_pcm16_bytes(audio_chunk)
+                await self.write_event(
+                    AudioChunk(
+                        rate=self._sample_rate,
+                        width=2,
+                        channels=1,
+                        audio=audio_bytes,
+                    ).event()
+                )
+            
+            # Send audio stop event
+            await self.write_event(AudioStop().event())
+            LOGGER.info("Streaming synthesis complete")
+            
+        except Exception as err:
+            LOGGER.exception("Error in streaming synthesis")
             await self.write_event(
                 Error(
-                    text="Not in streaming mode",
+                    text=str(err),
+                    code=type(err).__name__,
+                ).event()
+            )
+
+    async def _handle_synthesize_chunk(self, event: Event) -> None:
+        """Accumulate text chunks for streaming synthesis."""
+        if not self._stream_text_queue:
+            await self.write_event(
+                Error(
+                    text="Stream text queue has not been initialized",
                     code="streaming-not-started",
                 ).event()
             )
             return
 
         synthesize_chunk = SynthesizeChunk.from_event(event)
-        self._stream_text_buffer += synthesize_chunk.text
-        LOGGER.debug("Received text chunk: '%s'", synthesize_chunk.text)
+        await self._stream_text_queue.put(synthesize_chunk.text)
 
     async def _handle_synthesize_stop(self) -> None:
         """Finalize and synthesize accumulated text."""
-        if not self._streaming:
+        if not self._stream_text_queue:
             await self.write_event(
                 Error(
-                    text="Not in streaming mode",
+                    text="Stream text queue has not been initialized",
                     code="streaming-not-started",
                 ).event()
             )
             return
 
-        voice = self._stream_voice
-        text = self._stream_text_buffer
+        # Signal end of text stream
+        await self._stream_text_queue.put(None)
         
+        # Wait for synthesis task to complete
+        if self._stream_task:
+            try:
+                await self._stream_task
+            except Exception as err:
+                LOGGER.exception("Error waiting for synthesis task")
+
         # Reset streaming state
-        self._streaming = False
         self._stream_voice = None
-        self._stream_text_buffer = ""
+        self._stream_text_queue = None
+        self._stream_task = None
+        LOGGER.info("Stopped streaming synthesis")
 
-        if not text.strip():
-            LOGGER.warning("No text to synthesize")
-            await self.write_event(AudioStop().event())
-            return
-
-        LOGGER.info("Synthesizing accumulated text: '%s'", text)
-        await self._synthesize_and_stream(text, voice)
+    async def _get_text_stream(self) -> AsyncGenerator[str]:
+        """Asynchronously yield text chunks from the queue."""
+        try:
+            while True:
+                if self._stream_text_queue is None:
+                    LOGGER.warning("Text stream queue is None, ending stream")
+                    break
+                text_chunk = await self._stream_text_queue.get()
+                if text_chunk is None:
+                    LOGGER.info("Text stream ended (received None)")
+                    break
+                yield text_chunk
+        except asyncio.CancelledError:
+            LOGGER.info("Text stream cancelled")
+            raise
 
     async def _synthesize_and_stream(self, text: str, voice) -> None:
         """Synthesize text and stream audio back to client."""
         try:
             # Check if streaming inference is available
-            if hasattr(self._tts, 'infer_stream'):
+            if hasattr(self._tts, 'infer_to_stream'):
                 await self._synthesize_streaming(text, voice)
             else:
                 await self._synthesize_non_streaming(text, voice)
@@ -210,7 +267,7 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
         )
 
         # Stream audio chunks as they're generated
-        for audio_chunk in await asyncio.to_thread(lambda: list(self._tts.infer_stream(text, voice.ref_codes, voice.ref_text))):
+        for audio_chunk in self._tts.infer_to_stream(text, voice.ref_codes, voice.ref_text):
             audio_bytes = _to_pcm16_bytes(audio_chunk)
             
             await self.write_event(
@@ -271,16 +328,6 @@ class NeuTTSAirEventHandler(AsyncEventHandler):
 
         return self._voices.get(self._default_voice)
 
-def _chunk_bytes(data: bytes, chunk_size: int) -> Iterable[bytes]:
-    if chunk_size <= 0:
-        yield data
-        return
-
-    data_len = len(data)
-    for idx in range(0, data_len, chunk_size):
-        end = idx + chunk_size
-        yield data[idx:end]
-
 
 def _to_pcm16_bytes(audio: np.ndarray | torch.Tensor) -> bytes:
     if isinstance(audio, torch.Tensor):
@@ -303,7 +350,7 @@ def _parse_voice_arg(raw: str) -> Dict[str, str]:
             continue
         if "=" not in section:
             message = (
-                "Voice definition '{raw}' must use key=value pairs " "separated by commas"
+                "Voice definition '{raw}' must use key=value pairs separated by commas"
             ).format(raw=raw)
             raise ValueError(message)
         key, value = section.split("=", 1)
@@ -316,12 +363,7 @@ def _parse_voice_arg(raw: str) -> Dict[str, str]:
         raise ValueError(message)
 
     if ("ref_audio" not in parts) and ("ref_codes" not in parts):
-        message = " ".join(
-            [
-                "Voice definition must include either 'ref_audio'",
-                "or 'ref_codes'",
-            ]
-        )
+        message = "Voice definition must include either 'ref_audio' or 'ref_codes'"
         raise ValueError(message)
 
     return parts
@@ -329,7 +371,7 @@ def _parse_voice_arg(raw: str) -> Dict[str, str]:
 
 def _flatten_codes(
     codes: np.ndarray | torch.Tensor | Iterable[int],
-) -> List[int]:
+) -> np.ndarray:
     if isinstance(codes, torch.Tensor):
         codes = codes.detach().cpu().view(-1).tolist()
     elif isinstance(codes, np.ndarray):
@@ -337,10 +379,10 @@ def _flatten_codes(
     else:
         codes = list(codes)
 
-    return [int(code) for code in codes]
+    return np.array([int(code) for code in codes], dtype=np.int32)
 
 
-def _load_ref_codes(path: Path) -> List[int]:
+def _load_ref_codes(path: Path) -> np.ndarray:
     suffix = path.suffix.lower()
     if suffix in {".pt", ".pth"}:
         data = torch.load(path, map_location="cpu")
@@ -348,7 +390,7 @@ def _load_ref_codes(path: Path) -> List[int]:
         data = np.load(path)
     else:
         message = (
-            "Unsupported reference code format '{suffix}'. Expected " ".pt, .pth, or .npy"
+            "Unsupported reference code format '{suffix}'. Expected .pt, .pth, or .npy"
         ).format(suffix=path.suffix)
         raise ValueError(message)
 
@@ -441,7 +483,7 @@ async def _run_server(args: argparse.Namespace) -> None:
                 installed=True,
                 voices=tts_program_voices,
                 version=None,
-                supports_synthesize_streaming=False,
+                supports_synthesize_streaming=True,
             )
         ]
     )

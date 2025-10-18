@@ -1,1 +1,16 @@
+# Python
+*.pyc
+*.pyo
+__pycache__/
+.venv
+venv
+
+# Git
+.git
+.gitignore
+
+#Docker
+Dockerfile
+.dockerignore
+
 models/
